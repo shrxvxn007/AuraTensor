@@ -22,14 +22,14 @@ class GgufFileTest {
         //  - aligned tensor-info section (empty, since tensorCount=0)
         //  - aligned data section (empty)
         // Layout (with parser 8-byte alignment after key read):
-        //   pos 24   long: key length = 19
-        //   pos 32-50 19 bytes: "general.architecture"
-        //   pos 51-55 5 bytes: zero-pad (parser aligns to 56)
+        //   pos 24   long: key length = 20
+        //   pos 32-51 20 bytes: "general.architecture"
+        //   pos 52-55 4 bytes: zero-pad (parser aligns to 56)
         //   pos 56   int: value-type STRING = 8
         //   pos 60-63 4 bytes: zero-pad (parser aligns to 64)
         //   pos 64   long: string length = 5
         //   pos 72   5 bytes: "llama"
-        long fileLen = 24 + 8 + 19 + 5 + 4 + 4 + 8 + 5 + 3;
+        long fileLen = 24 + 8 + 20 + 4 + 4 + 4 + 8 + 5 + 3;
         fileLen = ((fileLen + 31) / 32) * 32;
 
         Arena arena = Arena.ofConfined();
@@ -41,10 +41,10 @@ class GgufFileTest {
         seg.set(ValueLayout.JAVA_LONG, 16, 1L);                // metadataKvCount = 1
 
         long pos = 24;
-        seg.set(ValueLayout.JAVA_LONG, pos, 19L);              // key length = 19
+        seg.set(ValueLayout.JAVA_LONG, pos, 20L);              // key length = 20 bytes (strlen("general.architecture"))
         pos += 8;                                              // pos=32
-        seg.setString(pos, "general.architecture");
-        pos += 19;                                             // pos=51 (parser will align to 56)
+        seg.setString(pos, "general.architecture");           // writes 20 UTF-8 bytes at 32..51
+        pos += 20;                                             // pos=52 (parser will align to 56)
         while (pos < 56) {                                     // zero-pad to int position
             seg.set(ValueLayout.JAVA_BYTE, pos, (byte) 0);
             pos++;

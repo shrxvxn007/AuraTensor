@@ -167,58 +167,67 @@ public final class Kernels {
         int d = shape[rank - 1];
         int leading = (int) (x.numElements() / d);
         MemorySegment seg = x.data();
-        var species = Simd.SPECIES;
-        int upper = species.loopBound(d);
-
         for (int row = 0; row < leading; row++) {
             long rowOff = (long) row * d * 4L;
+            softmaxInPlaceSegment(seg.asSlice(rowOff, (long) d * 4L), d);
+        }
+    }
 
-            // 1) find max
-            FloatVector vmax = FloatVector.broadcast(species, Float.NEGATIVE_INFINITY);
-            for (int i = 0; i < upper; i += species.length()) {
-                FloatVector v = FloatVector.fromMemorySegment(
-                    species, seg, rowOff + (long) i * 4L, ByteOrder.nativeOrder());
-                vmax = vmax.max(v);
-            }
-            float rowMax = vmax.reduceLanes(VectorOperators.MAX);
-            for (int i = upper; i < d; i++) {
-                float xv = seg.get(ValueLayout.JAVA_FLOAT, rowOff + (long) i * 4L);
-                if (xv > rowMax) rowMax = xv;
-            }
+    /**
+     * In-place stable softmax on the first {@code n} floats of {@code seg}.
+     * Used by the attention reduction in {@link io.auratensor.inference.LlamaModel}
+     * to softmax only the position-prefix range of a scratch buffer.
+     */
+    public static void softmaxInPlaceSegment(MemorySegment seg, int n) {
+        var species = Simd.SPECIES;
+        int upper = species.loopBound(n);
 
-            // 2) exp(x - max) and sum
-            FloatVector vsum = FloatVector.zero(species);
-            for (int i = 0; i < upper; i += species.length()) {
-                FloatVector v = FloatVector.fromMemorySegment(
-                    species, seg, rowOff + (long) i * 4L, ByteOrder.nativeOrder());
-                v = v.sub(rowMax);
-                // exp via array is regrettable — see siluInPlace for context.
-                float[] arr = v.toArray();
-                for (int j = 0; j < arr.length; j++) arr[j] = (float) Math.exp(arr[j]);
-                FloatVector ev = FloatVector.fromArray(species, arr, 0);
-                ev.intoMemorySegment(seg, rowOff + (long) i * 4L, ByteOrder.nativeOrder());
-                vsum = ev.add(vsum);
-            }
-            float rowSum = vsum.reduceLanes(VectorOperators.ADD);
-            for (int i = upper; i < d; i++) {
-                float ev = (float) Math.exp(
-                    seg.get(ValueLayout.JAVA_FLOAT, rowOff + (long) i * 4L) - rowMax);
-                seg.set(ValueLayout.JAVA_FLOAT, rowOff + (long) i * 4L, ev);
-                rowSum += ev;
-            }
+        // 1) find max
+        FloatVector vmax = FloatVector.broadcast(species, Float.NEGATIVE_INFINITY);
+        for (int i = 0; i < upper; i += species.length()) {
+            FloatVector v = FloatVector.fromMemorySegment(
+                species, seg, (long) i * 4L, ByteOrder.nativeOrder());
+            vmax = vmax.max(v);
+        }
+        float rowMax = vmax.reduceLanes(VectorOperators.MAX);
+        for (int i = upper; i < n; i++) {
+            float xv = seg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L);
+            if (xv > rowMax) rowMax = xv;
+        }
 
-            // 3) normalize
-            float inv = 1.0f / rowSum;
-            FloatVector vinv = FloatVector.broadcast(species, inv);
-            for (int i = 0; i < upper; i += species.length()) {
-                FloatVector v = FloatVector.fromMemorySegment(
-                    species, seg, rowOff + (long) i * 4L, ByteOrder.nativeOrder());
-                v.mul(inv).intoMemorySegment(
-                    seg, rowOff + (long) i * 4L, ByteOrder.nativeOrder());
-            }
-            for (int i = upper; i < d; i++) {
-                seg.set(ValueLayout.JAVA_FLOAT, rowOff + (long) i * 4L, seg.get(ValueLayout.JAVA_FLOAT, rowOff + (long) i * 4L) * inv);
-            }
+        // 2) exp(x - max) and sum
+        FloatVector vsum = FloatVector.zero(species);
+        for (int i = 0; i < upper; i += species.length()) {
+            FloatVector v = FloatVector.fromMemorySegment(
+                species, seg, (long) i * 4L, ByteOrder.nativeOrder());
+            v = v.sub(rowMax);
+            // exp via array is regrettable — see siluInPlace for context.
+            float[] arr = v.toArray();
+            for (int j = 0; j < arr.length; j++) arr[j] = (float) Math.exp(arr[j]);
+            FloatVector ev = FloatVector.fromArray(species, arr, 0);
+            ev.intoMemorySegment(seg, (long) i * 4L, ByteOrder.nativeOrder());
+            vsum = ev.add(vsum);
+        }
+        float rowSum = vsum.reduceLanes(VectorOperators.ADD);
+        for (int i = upper; i < n; i++) {
+            float ev = (float) Math.exp(
+                seg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L) - rowMax);
+            seg.set(ValueLayout.JAVA_FLOAT, (long) i * 4L, ev);
+            rowSum += ev;
+        }
+
+        // 3) normalize
+        float inv = 1.0f / rowSum;
+        FloatVector vinv = FloatVector.broadcast(species, inv);
+        for (int i = 0; i < upper; i += species.length()) {
+            FloatVector v = FloatVector.fromMemorySegment(
+                species, seg, (long) i * 4L, ByteOrder.nativeOrder());
+            v.mul(inv).intoMemorySegment(
+                seg, (long) i * 4L, ByteOrder.nativeOrder());
+        }
+        for (int i = upper; i < n; i++) {
+            seg.set(ValueLayout.JAVA_FLOAT, (long) i * 4L,
+                    seg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L) * inv);
         }
     }
 
@@ -308,28 +317,35 @@ public final class Kernels {
         if (x.numElements() != K || y.numElements() != M) {
             throw new IllegalArgumentException("sgemv: dim mismatch");
         }
-        MemorySegment aseg = A.data();
-        MemorySegment xseg = x.data();
-        MemorySegment yseg = y.data();
+        sgemv(A.data(), x.data(), y.data(), M, K);
+    }
+
+    /**
+     * SIMD sgemv over raw {@link MemorySegment}s — y[M] = A[M,K] * x[K].
+     * Used by {@link io.auratensor.inference.LlamaModel} for the attention
+     * reduction, where the {@code A} operand is a {@link MemorySegment#asSlice
+     * asSlice} view into the flat KV cache. Byte order: native.
+     */
+    public static void sgemv(MemorySegment aSeg, MemorySegment xSeg, MemorySegment ySeg,
+                             int M, int K) {
         var species = Simd.SPECIES;
         int upper = species.loopBound(K);
-
         for (int i = 0; i < M; i++) {
             long rowOff = (long) i * K * 4L;
             FloatVector acc = FloatVector.zero(species);
             for (int k = 0; k < upper; k += species.length()) {
                 FloatVector av = FloatVector.fromMemorySegment(
-                    species, aseg, rowOff + (long) k * 4L, ByteOrder.nativeOrder());
+                    species, aSeg, rowOff + (long) k * 4L, ByteOrder.nativeOrder());
                 FloatVector xv = FloatVector.fromMemorySegment(
-                    species, xseg, (long) k * 4L, ByteOrder.nativeOrder());
+                    species, xSeg, (long) k * 4L, ByteOrder.nativeOrder());
                 acc = av.fma(xv, acc);
             }
             float sum = acc.reduceLanes(VectorOperators.ADD);
             for (int k = upper; k < K; k++) {
-                sum += aseg.get(ValueLayout.JAVA_FLOAT, rowOff + (long) k * 4L)
-                     * xseg.get(ValueLayout.JAVA_FLOAT, (long) k * 4L);
+                sum += aSeg.get(ValueLayout.JAVA_FLOAT, rowOff + (long) k * 4L)
+                     * xSeg.get(ValueLayout.JAVA_FLOAT, (long) k * 4L);
             }
-            yseg.set(ValueLayout.JAVA_FLOAT, (long) i * 4L, sum);
+            ySeg.set(ValueLayout.JAVA_FLOAT, (long) i * 4L, sum);
         }
     }
 
@@ -356,10 +372,62 @@ public final class Kernels {
     }
 
     public static void sgemm(MemorySegment aSeg, MemorySegment bSeg, MemorySegment cSeg,
-                             int M, int K, int N) {        // The original SIMD inner loop used a wrong strided read of B in
-        // row-major memory. For correctness, delegate to the scalar baseline.
-        // A register-tiled SIMD implementation is tracked separately.
-        sgemmScalar(aSeg, bSeg, cSeg, M, K, N);
+                             int M, int K, int N) {
+        // Register-tile SIMD SGEMM, exploiting the J-axis of B (row-major
+        // column stride = 1) to vectorize the inner K reduction across a
+        // SPECIES-wide column tile. M=1 / K=N is the LLM-decode hot path.
+        //
+        // Algorithm:
+        //   for each output row i:
+        //     for each column tile jc in 0..loopBound(N):
+        //       acc = zero
+        //       for k in 0..K:
+        //         aik = A[i,k]                                (scalar broadcast)
+        //         bv  = [B[k,jc], B[k,jc+1], ..., B[k,jc+3]]  (stride-1 along j)
+        //         acc = bv * aik + acc                         (FMA over SPECIES lanes)
+        //       write acc into C[i, jc:jc+SPECIES]
+        //     tail: scalar fill jc .. N (when N % SPECIES != 0)
+        //
+        // Why this is correct:
+        //   - reading bv along the J axis is stride-1 in row-major B, so
+        //     fromMemorySegment reads exactly SPECIES contiguous floats.
+        //   - accumulator lane-l after the K loop equals
+        //     sum_k ( A[i,k] * B[k, jc+l] ) = C[i, jc+l] (per the GEMM def).
+        // ByteOrder: ByteOrder.nativeOrder() is mandatory on JDK 25 (JEP 489
+        // eighth incubator); Apple Silicon NEON is little-endian, matching.
+        var species = Simd.SPECIES;
+        int upperN = species.loopBound(N);
+
+        for (int i = 0; i < M; i++) {
+            long rowA = (long) i * K * 4L;
+            long rowC = (long) i * N * 4L;
+
+            // SIMD block across N (lane = column index jc+l)
+            for (int jc = 0; jc < upperN; jc += species.length()) {
+                FloatVector acc = FloatVector.zero(species);
+                long cOff = rowC + (long) jc * 4L;
+                for (int k = 0; k < K; k++) {
+                    float aik = aSeg.get(ValueLayout.JAVA_FLOAT, rowA + (long) k * 4L);
+                    FloatVector bv = FloatVector.fromMemorySegment(
+                        species, bSeg,
+                        (long) k * N * 4L + (long) jc * 4L,
+                        ByteOrder.nativeOrder());
+                    acc = bv.fma(FloatVector.broadcast(species, aik), acc);
+                }
+                acc.intoMemorySegment(cSeg, cOff, ByteOrder.nativeOrder());
+            }
+
+            // Scalar tail for N that is not a multiple of SPECIES
+            for (int jc = upperN; jc < N; jc++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    sum += aSeg.get(ValueLayout.JAVA_FLOAT, rowA + (long) k * 4L)
+                         * bSeg.get(ValueLayout.JAVA_FLOAT,
+                                    (long) k * N * 4L + (long) jc * 4L);
+                }
+                cSeg.set(ValueLayout.JAVA_FLOAT, rowC + (long) jc * 4L, sum);
+            }
+        }
     }
 
     /**

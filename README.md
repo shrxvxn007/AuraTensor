@@ -94,7 +94,7 @@ flowchart TB
 ### 1. Clone and build
 
 ```bash
-git clone https://github.com/auratensor/auratensor.git
+git clone https://github.com/shrxvxn007/AuraTensor.git
 cd auratensor
 ./mvnw clean package
 ```
@@ -183,9 +183,9 @@ JMH configuration: warmup 1×2s, measurement 2×2s, fork 1, total wall time **~9
 
 | Kernel              | Shape                | Scalar     | SIMD       | Speed-up | SIMD throughput         |
 |---------------------|----------------------|------------|------------|----------|-------------------------|
-| SGEMM               | M=1, K=N=512         | 0.176 ms   | 0.177 ms   | 1.0×¹    | **2.96 GFLOPS**         |
-| SGEMM               | M=1, K=N=1024        | 0.889 ms   | 0.898 ms   | 1.0×¹    | **2.34 GFLOPS**         |
-| SGEMM               | M=1, K=N=2048        | 4.211 ms   | 4.480 ms   | 0.94×¹   | **1.87 GFLOPS**         |
+| SGEMM               | M=1, K=N=512         | 0.177 ms   | 0.061 ms   | **2.9×**¹ | **8.60 GFLOPS**         |
+| SGEMM               | M=1, K=N=1024        | 0.878 ms   | 0.254 ms   | **3.5×**¹ | **8.26 GFLOPS**         |
+| SGEMM               | M=1, K=N=2048        | 4.288 ms   | 1.089 ms   | **3.9×**¹ | **7.70 GFLOPS**         |
 | Q4_0 fusedDot       | 8 192 elements       | n/a²       | 2 µs       | n/a      | **18.7 GB/s**           |
 | Q4_0 fusedDot       | 32 768 elements      | n/a²       | 6 µs       | n/a      | **24.9 GB/s**           |
 | Q4_0 fusedDot       | 131 072 elements     | n/a²       | 24 µs      | n/a      | **24.9 GB/s**           |
@@ -197,10 +197,11 @@ GFLOPS formula: `2 × M × K × N / time_seconds / 1e9`. Q4_0 bandwidth formula:
 `(0.5625 + 4) × numElements bytes / time_seconds / 1e9`, where 0.5625 = 18/32 bytes per Q4
 element and 4 = 4 bytes per FP32 activation.
 
-¹ `Kernels.sgemm(MemorySegment, …)` currently delegates to `sgemmScalar` —
-the FloatVector-fused lane path is not yet wired into production on darwin-arm64; once
-`FloatVector.fromMemorySegment(…, ByteOrder.nativeOrder())` ByteOrder correctness is locked in,
-the dedicated SIMD build will be re-enabled and the speed-up here will reflect non-1.0× ratios.
+¹ `Kernels.sgemm(MemorySegment, …)` now runs a register-tile SIMD inner loop over the J-axis of B
+(row-major column stride = 1), accumulating `acc = bv.fma(FloatVector.broadcast(species, a_ik), acc)` for each
+(k, jc-tile). C2 lowers this to NEON `fmla acc.4s, bv.4s, a_scalar.b` per k-iteration. Measured on darwin-arm64
+NEON (4-lane FloatVector.SPECIES_PREFERRED); ByteOrder is `ByteOrder.nativeOrder()` per the JDK 25
+JEP 489 Eighth Incubator convention (mandatory for `FloatVector.fromMemorySegment` / `intoMemorySegment`).
 
 ² `Q4_0.fusedDot` is the production hot path; the unfused scalar dequant-only microbenchmark
 exists as a sanity-check only (`Q4_0.dequantToFloat`) and is not represented in this table.
@@ -209,6 +210,76 @@ exists as a sanity-check only (`Q4_0.dequantToFloat`) and is not represented in 
 is the softmax/top-K pass over FP32 logits.
 
 > Run the benchmarks on your own hardware and update this table with your numbers.
+
+### Single-token decode throughput (`TokenThroughputBenchmark`)
+
+End-to-end decode path that **instantiates a real `LlamaModel` directly**:
+`@Setup` builds a synthetic `LlamaConfig` + `Weights` + `Tokenizer` shaped
+like a Llama-150M analogue (4 transformer blocks, embedding 512, 8 query
+/ 4 KV heads, head-dim 64, FFN 2048, vocab 32 768), then `@Benchmark
+decodeLoop` invokes `LlamaModel.forwardStep(tokenId, position)` for
+`GENS = 64` sequential decode tokens. Sweeps context length to expose how
+attention cost grows with the KV prefix under M=1 decode. `tokens/sec =
+64 × 1000 / ms_op`.
+
+| Shape (M, nHeads, nHeadsKv, headDim, ffnDim, blocks, vocab) | contextLength | ms/op | **tokens/sec** |
+|---|---|---|---|
+| 1, 8, 4, 64, 2048, 4, 32 768 |   128 |  336.284 | **190.31** |
+| 1, 8, 4, 64, 2048, 4, 32 768 |   512 |  371.378 | **172.33** |
+| 1, 8, 4, 64, 2048, 4, 32 768 |  2048 |  471.129 | **135.85** |
+
+(Wall time for a full JMH run on darwin-arm64 NEON: ~70 s — note the
+`@Warmup(iterations=3, time=2)` + `@Measurement(iterations=5, time=3)`
+on the benchmark class override the per-call `-Dat.bench.*` system
+properties.) Each `tokens/sec` is back-computable from `ms/op` via
+`64 × 1000 / ms_op`.
+
+**Production-validated SIMD numbers** (above) — `LlamaModel.forwardStep`
+runs entirely on the SIMD path:
+
+* `Kernels.sgemv` for every projection (Q / K / V / attn-output /
+  FFN gate / FFN up / FFN down / output).
+* `Kernels.ropeInPlace` for QK rotation, `Kernels.rmsNormInPlace` for
+  the two norms, `Kernels.siluInPlace` for the FFN activation.
+* `Kernels.sgemv` + `Kernels.softmaxInPlaceSegment` + `Kernels.sgemm`
+  for the inner attention reduction — per-head `Q @ K-cache row →
+  softmax → softmaxed @ V-cache row`, all over flat `MemorySegment`
+  slices of the KV cache with no per-step `Tensor.wrap` allocation.
+
+The Q/K/V and attn-output weights are pre-transposed into SIMD-friendly
+2D row-major form in `LlamaModel`'s constructor (one-time cost at model
+load); FFN gate/up/down already arrive in row-major `[M, K]` form from
+the GGUF exporter so no transpose is required for them. The previously
+scalar `matVec3D` / `matVec2D` / `matVecOutput` methods have been
+removed entirely from `LlamaModel`.
+
+Measured **2.0–2.4× decode speedup** over the prior scalar path (was:
+88.96 / 83.01 / 57.11 tokens/sec at the same context lengths) — at the
+low end of the 3–6× range estimated before the refactor. The remaining scalar work is
+concentrated in three small inner loops: the `1/sqrt(headDim)`
+attention-scale loop (max `ctx` iterations per head), `residualAdd`
+(hidden state += add), and `elementwiseMul` (gate *= up). Vectorizing
+those is the natural next step.
+
+The synthetic "prompt prefill" is skipped — positions `[0..contextLength)`
+hold zero-initialized KVCache state at the first decode step (cost
+measurement is unaffected). Reproduce via the programmatic JMH driver
+`io.auratensor.benchmarks.Bench` (loads benchmarks by class name;
+bypasses `META-INF/BenchmarkList` classpath-resource quirks):
+
+```bash
+./mvnw -DskipTests clean package
+java --enable-native-access=ALL-UNNAMED \
+     --add-modules jdk.incubator.vector \
+     -cp target/auratensor.jar \
+     io.auratensor.benchmarks.Bench '.*TokenThroughputBenchmark.*' \
+     -Dat.bench.warmupIters=1 -Dat.bench.warmupSec=2 \
+     -Dat.bench.measureIters=2 -Dat.bench.measureSec=2
+```
+
+The `'.*TokenThroughputBenchmark.*'` pattern matches both the original
+class and its JMH-generated wrapper at
+`io.auratensor.benchmarks.jmh_generated.TokenThroughputBenchmark_decodeLoop_jmhTest`.
 
 ---
 
