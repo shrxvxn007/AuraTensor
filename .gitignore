@@ -1,0 +1,26 @@
+# Compiled output
+target/
+*.class
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+*.swp
+.DS_Store
+
+# Maven wrapper jar (we use a script-based wrapper instead)
+.mvn/wrapper/maven-wrapper.jar
+
+# Benchmark output
+benchmarks-results/
+jmh-*.json
+*.jfr
+
+# Logs
+*.log
+logs/
