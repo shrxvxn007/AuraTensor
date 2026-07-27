@@ -9,6 +9,14 @@ import java.lang.foreign.ValueLayout;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * Verifies the GGUF v3 binary parser on the spec-conformant
+ * tightly-packed layout: every metadata field (key length, key bytes,
+ * value-type int, value length, value bytes) is stored back-to-back
+ * with no padding between them. GGUF v3 made the previous
+ * zero-pad-to-8-byte convention obsolete; only the data section offset
+ * honours a per-file alignment declared in metadata (default 32 bytes).
+ */
 class GgufFileTest {
 
     @Test
@@ -19,17 +27,14 @@ class GgufFileTest {
         //  - tensorCount = 0
         //  - metadataKvCount = 1
         //  - one KV: "general.architecture" = "llama"
-        //  - aligned tensor-info section (empty, since tensorCount=0)
-        //  - aligned data section (empty)
-        // Layout (with parser 8-byte alignment after key read):
+        // Tightly-packed layout (per GGUF v3 spec — NO inter-field padding):
         //   pos 24   long: key length = 20
         //   pos 32-51 20 bytes: "general.architecture"
-        //   pos 52-55 4 bytes: zero-pad (parser aligns to 56)
-        //   pos 56   int: value-type STRING = 8
-        //   pos 60-63 4 bytes: zero-pad (parser aligns to 64)
-        //   pos 64   long: string length = 5
-        //   pos 72   5 bytes: "llama"
-        long fileLen = 24 + 8 + 20 + 4 + 4 + 4 + 8 + 5 + 3;
+        //   pos 52   int: value-type STRING = 8
+        //   pos 56   long: string length = 5
+        //   pos 64   5 bytes: "llama"
+        // Round file length up to next 32-byte boundary for the data section.
+        long fileLen = 24 + 8 + 20 + 4 + 8 + 5;
         fileLen = ((fileLen + 31) / 32) * 32;
 
         Arena arena = Arena.ofConfined();
@@ -41,28 +46,15 @@ class GgufFileTest {
         seg.set(ValueLayout.JAVA_LONG, 16, 1L);                // metadataKvCount = 1
 
         long pos = 24;
-        seg.set(ValueLayout.JAVA_LONG, pos, 20L);              // key length = 20 bytes (strlen("general.architecture"))
+        seg.set(ValueLayout.JAVA_LONG, pos, 20L);              // key length = 20 (strlen("general.architecture"))
         pos += 8;                                              // pos=32
         seg.setString(pos, "general.architecture");           // writes 20 UTF-8 bytes at 32..51
-        pos += 20;                                             // pos=52 (parser will align to 56)
-        while (pos < 56) {                                     // zero-pad to int position
-            seg.set(ValueLayout.JAVA_BYTE, pos, (byte) 0);
-            pos++;
-        }
+        pos += 20;                                             // pos=52
         seg.set(ValueLayout.JAVA_INT, pos, 8);                 // value-type STRING (enum code 8)
-        pos += 4;                                              // pos=60
-        while (pos < 64) {                                     // zero-pad to long position
-            seg.set(ValueLayout.JAVA_BYTE, pos, (byte) 0);
-            pos++;
-        }
+        pos += 4;                                              // pos=56
         seg.set(ValueLayout.JAVA_LONG, pos, 5L);               // value-length = 5
-        pos += 8;                                              // pos=72
-        seg.setString(pos, "llama");                           // pos=72
-        pos += 5;                                              // pos=77
-        while (pos < fileLen) {                                // zero-pad to fileLen
-            seg.set(ValueLayout.JAVA_BYTE, pos, (byte) 0);
-            pos++;
-        }
+        pos += 8;                                              // pos=64
+        seg.setString(pos, "llama");                           // writes 5 bytes at 64..68
 
         // Write the built memory into a temp file and round-trip through GgufFile.
         java.nio.file.Path tmp = java.nio.file.Files.createTempFile("auratensor-test", ".gguf");

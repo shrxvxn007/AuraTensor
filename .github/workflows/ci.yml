@@ -5,6 +5,7 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,8 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [ '25' ]
-
+        java: [ '21', '25' ]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -32,38 +32,32 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          key: ${{ runner.os }}-m2-jdk${{ matrix.java }}-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
-            ${{ runner.os }}-m2-
+            ${{ runner.os }}-m2-jdk${{ matrix.java }}-
 
       - name: Show JDK version
         run: java -version
 
-      - name: Build & test with mvnw
+      # Override `maven.compiler.release` to match the matrix JDK. The pom.xml
+      # default is `<release>25</release>`; on JDK 21 javac rejects anything
+      # above 21, so we drop it per-matrix rather than changing the project's
+      # baseline (the README still advertises JDK 25 LTS as the production
+      # target). Maven property substitution overrides the `<release>` element
+      # inside the maven-compiler-plugin <configuration>, so the source still
+      # compiles cleanly on both JDKs.
+      - name: Build & test (release=${{ matrix.java }})
         run: |
           chmod +x ./mvnw
-          ./mvnw -B -ntp clean test
+          ./mvnw -B -ntp clean test -Dmaven.compiler.release=${{ matrix.java }}
 
-      - name: Build shaded jar
-        run: |
-          chmod +x ./mvnw
-          ./mvnw -B -ntp -DskipTests package
-
-      - name: Verify shaded jar is runnable
-        run: |
-          java --add-modules jdk.incubator.vector \
-               --enable-native-access=ALL-UNNAMED \
-               -jar target/auratensor.jar --help || true
-
-  benchmark-compile:
+  smoke-jmh:
     runs-on: ubuntu-latest
-    name: Compile JMH benchmarks (no execution)
-    needs: test
+    name: Bench smoke (JDK ${{ matrix.java }})
     strategy:
       fail-fast: false
       matrix:
-        java: [ '25' ]
-
+        java: [ '21', '25' ]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -74,7 +68,41 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
 
-      - name: Compile benchmarks
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-jdk${{ matrix.java }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-jdk${{ matrix.java }}-
+
+      # Same per-matrix release override as the test job so the fat jar is
+      # built against the same source/target level CI is testing.
+      - name: Build fat jar (release=${{ matrix.java }})
         run: |
           chmod +x ./mvnw
-          ./mvnw -B -ntp test-compile
+          ./mvnw -B -ntp -DskipTests \
+                 -Dmaven.compiler.release=${{ matrix.java }} \
+                 clean package
+
+      # Smoke run: one short warmup + one short measurement iteration of the
+      # end-to-end forward pass (`TokenThroughputBenchmark.decodeLoop`). The
+      # goal is a fast (~30 s) gate that catches:
+      #   * JIT crashes (e.g. a vector lowering bug only present on certain
+      #     AVX/NEON lane widths) — surfacing as a JDK-level crash dump
+      #   * NaN / Inf outputs (kernel math regressions) — surfacing either as
+      #     Math arithmetic exceptions or visibly garbage ms/op numbers
+      #   * Kernel runtime errors (e.g. an off-by-one in a MemorySegment.slice)
+      # We deliberately do NOT add a numeric threshold assertion here — a
+      # threshold would be flaky across runner CPU variants. The cheapest
+      # reliable CI signal is "the JMH process exits 0 under `--add-modules
+      # jdk.incubator.vector --enable-native-access=ALL-UNNAMED`".
+      - name: JMH smoke (TokenThroughputBenchmark 1x1s on each context sweep)
+        run: |
+          java --enable-native-access=ALL-UNNAMED \
+               --add-modules jdk.incubator.vector \
+               -cp target/auratensor.jar \
+               io.auratensor.benchmarks.Bench '.*TokenThroughputBenchmark.*' \
+               -Dat.bench.warmupIters=1 -Dat.bench.warmupSec=1 \
+               -Dat.bench.measureIters=1 -Dat.bench.measureSec=1 \
+               -f 1

@@ -1,7 +1,5 @@
 package io.auratensor.inference;
 
-import io.auratensor.core.Tensor;
-import io.auratensor.core.DType;
 import io.auratensor.core.Kernels;
 
 import java.lang.foreign.Arena;
@@ -18,20 +16,37 @@ import java.lang.foreign.ValueLayout;
  * expects (lane i of the QK vector pairs with cos[i]).
  *
  * <p>Llama 3 uses base = 500_000; Llama 2 and Mistral use base = 10_000.
+ *
+ * <p>The full cos/sin tables live in a single shared {@link Arena} and are
+ * exposed as flat {@link MemorySegment}s via {@link #cosSegment()} /
+ * {@link #sinSegment()} (full tables) and {@link #cosSegmentFor(long, long)} /
+ * {@link #sinSegmentFor(long, long)} (per-position slices via
+ * {@link MemorySegment#asSlice}). This lets the inner forward loop
+ * ({@link LlamaModel#layerStep}) call {@link Kernels#ropeInPlaceSegment}
+ * directly on flat segments without any per-step {@code Arena.ofConfined} or
+ * {@code Tensor.wrap} allocation churn.
+ *
+ * <p>Note: there is no {@code close()} method on this cache. The lifetime of
+ * the underlying shared arena is bound to the {@code RopeCache} instance.
+ * Callers must hold a reference for as long as the model is alive.
  */
 public final class RopeCache {
 
-    private final Tensor cos;
-    private final Tensor sin;
+    /** Single shared Arena owns the lifetime of both cos and sin tables. */
+    private final Arena arena;
+    /** Cosine table — flat {@code [maxContext * headDim]} FP32. */
+    private final MemorySegment cosSeg;
+    /** Sine   table — flat {@code [maxContext * headDim]} FP32. */
+    private final MemorySegment sinSeg;
 
     public RopeCache(long headDim, float base, long maxContext) {
         long half = headDim / 2;
         long strideElems = headDim;
         // One row per position, length = headDim (cos duplicated per element).
         long n = maxContext * strideElems;
-        Arena arena = Arena.ofConfined();
-        MemorySegment cosSeg = arena.allocate(n * 4L, 16);
-        MemorySegment sinSeg = arena.allocate(n * 4L, 16);
+        arena = Arena.ofShared();
+        cosSeg = arena.allocate(n * 4L, 16);
+        sinSeg = arena.allocate(n * 4L, 16);
         long rowBytes = strideElems * 4L;
         for (long pos = 0; pos < maxContext; pos++) {
             long rowBase = pos * rowBytes;
@@ -47,22 +62,29 @@ public final class RopeCache {
                 sinSeg.set(ValueLayout.JAVA_FLOAT, rowBase + (2L * i + 1L) * 4L, s);
             }
         }
-        this.cos = Tensor.wrap(cosSeg, arena, DType.FP32,
-                               new int[]{ (int) (maxContext * strideElems) });
-        this.sin = Tensor.wrap(sinSeg, Arena.ofConfined(), DType.FP32,
-                               new int[]{ (int) (maxContext * strideElems) });
     }
 
-    public Tensor cosFor(long pos, long headDim) {
-        return slice(cos, pos * headDim, headDim);
+    /** Full cosine table as a flat {@link MemorySegment} (lifetime owned by this cache). */
+    public MemorySegment cosSegment() { return cosSeg; }
+
+    /** Full sine table as a flat {@link MemorySegment} (lifetime owned by this cache). */
+    public MemorySegment sinSegment() { return sinSeg; }
+
+    /**
+     * Per-position slice of the cosine table. Returns a zero-copy
+     * {@link MemorySegment#asSlice} view of length {@code headDim} floats
+     * &mdash; no per-call Arena allocation, no Tensor wrap.
+     */
+    public MemorySegment cosSegmentFor(long pos, long headDim) {
+        return cosSeg.asSlice(pos * headDim * 4L, headDim * 4L);
     }
 
-    public Tensor sinFor(long pos, long headDim) {
-        return slice(sin, pos * headDim, headDim);
-    }
-
-    private static Tensor slice(Tensor t, long start, long len) {
-        return Tensor.wrap(t.data().asSlice(start * 4L, len * 4L),
-                           Arena.ofConfined(), DType.FP32, new int[]{ (int) len });
+    /**
+     * Per-position slice of the sine table. Returns a zero-copy
+     * {@link MemorySegment#asSlice} view of length {@code headDim} floats
+     * &mdash; no per-call Arena allocation, no Tensor wrap.
+     */
+    public MemorySegment sinSegmentFor(long pos, long headDim) {
+        return sinSeg.asSlice(pos * headDim * 4L, headDim * 4L);
     }
 }

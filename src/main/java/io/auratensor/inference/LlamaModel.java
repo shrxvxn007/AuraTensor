@@ -197,14 +197,19 @@ public final class LlamaModel {
         Kernels.sgemv(attnKT[layer], hiddenState, kScratch);
         Kernels.sgemv(attnVT[layer], hiddenState, vScratch);
 
-        // Apply RoPE to q and k. ropeCache still allocates a Tensor.wrap per
-        // call (pre-existing allocation churn); see WeightsCache refactor for
-        // a future optimisation.
-        Tensor ropeCos = ropeCache.cosFor(position, cfg.headDim());
-        Tensor ropeSin = ropeCache.sinFor(position, cfg.headDim());
-        int headDim = (int) cfg.headDim();
-        Kernels.ropeInPlace(qScratch, ropeCos, ropeSin, headDim);
-        Kernels.ropeInPlace(kScratch, ropeCos, ropeSin, headDim);
+        // Apply RoPE to q and k via raw segments — zero per-step allocation.
+        // ropeCache.cosSegmentFor/sinSegmentFor return zero-copy
+        // MemorySegment.asSlice views into the shared Arena, and the raw
+        // ropeInPlaceSegment kernel consumes them directly. Previously this
+        // path allocated one Arena.ofConfined + Tensor.wrap per Q and per K
+        // (2 × cfg.blockCount() fresh allocations per forward step).
+        int headDim   = (int) cfg.headDim();
+        int nHeads    = (int) cfg.headCount();
+        int nHeadsKv  = (int) cfg.headCountKv();
+        MemorySegment cosRow = ropeCache.cosSegmentFor(position, headDim);
+        MemorySegment sinRow = ropeCache.sinSegmentFor(position, headDim);
+        Kernels.ropeInPlaceSegment(qScratch.data(), cosRow, sinRow, headDim, nHeads    * headDim);
+        Kernels.ropeInPlaceSegment(kScratch.data(), cosRow, sinRow, headDim, nHeadsKv  * headDim);
 
         // Write k, v into KV cache. The KV cache is flat [B, H, ctx, headDim];
         // kScratch / vScratch hold nHeadsKv * headDim contiguous floats.
@@ -307,57 +312,57 @@ public final class LlamaModel {
     // ---------------------------------------------------------------------
 
     /**
-     * Transpose a rank-3 GGUF attention projection weight
-     * {@code [embDim, nHeads{,Kv}, headDim]} into SIMD-friendly 2D form
-     * {@code [nHeads * headDim, embDim]}. After the transpose, the new
-     * layout has {@code W'[h*headDim + d, e] = W[e, h, d]}, which is the
-     * exact ordering {@link Kernels#sgemv} expects for the matvec
-     * {@code y[h*headDim + d] = sum_e W'[h*headDim + d, e] * x[e]}.
+     * Transpose a GGUF attention projection weight (rank-3
+     * {@code [embDim, nHeads{,Kv}, headDim]} per Meta's convention OR
+     * rank-2 {@code [embDim, nHeads * headDim]} per bartowski's
+     * flattened export) into SIMD-friendly 2D form
+     * {@code [nHeads * headDim, embDim]}. The byte-offset math is
+     * IDENTICAL for both ranks because the source stride inside the
+     * outer {@code e} loop is {@code nHeads * headDim * 4} bytes
+     * regardless of whether the inner dim is rank-3 decomposed or
+     * rank-2 flat. We use a single flat {@code k = h * headDim + d}
+     * index so the same loop works for both exports.
      */
     private static Tensor transposeAttnProj(Tensor src3D, int embDim, int nHeads, int headDim) {
-        Tensor dst = Tensor.allocate2D(DType.FP32, nHeads * headDim, embDim);
+        int totalK = nHeads * headDim;
+        Tensor dst = Tensor.allocate2D(DType.FP32, totalK, embDim);
         MemorySegment src = src3D.data();
         MemorySegment d   = dst.data();
-        long srcStrideE = (long) nHeads * headDim * 4L;
+        long srcStrideE = (long) totalK * 4L;
         long dstStrideR = (long) embDim * 4L;
         for (int e = 0; e < embDim; e++) {
             long srcRowBase = (long) e * srcStrideE;
-            for (int h = 0; h < nHeads; h++) {
-                long srcHeadBase = srcRowBase + (long) h * headDim * 4L;
-                long dstRowBase  = (long) (h * headDim) * dstStrideR + (long) e * 4L;
-                for (int dd = 0; dd < headDim; dd++) {
-                    d.set(ValueLayout.JAVA_FLOAT, dstRowBase + (long) dd * dstStrideR,
-                          src.get(ValueLayout.JAVA_FLOAT, srcHeadBase + (long) dd * 4L));
-                }
+            long dstColBase = (long) e * 4L;
+            for (int k = 0; k < totalK; k++) {
+                d.set(ValueLayout.JAVA_FLOAT, (long) k * dstStrideR + dstColBase,
+                      src.get(ValueLayout.JAVA_FLOAT, srcRowBase + (long) k * 4L));
             }
         }
         return dst;
     }
 
     /**
-     * Transpose a rank-3 GGUF attn-output weight
-     * {@code [nHeads, headDim, embDim]} into SIMD-friendly 2D form
-     * {@code [embDim, nHeads * headDim]}. After the transpose, the new
-     * layout has {@code W'[e, h*headDim + d] = W[h, d, e]}, which is the
-     * exact ordering {@link Kernels#sgemv} expects for the matvec
-     * {@code y[e] = sum_k W'[e, k] * x[k]}.
+     * Transpose a GGUF attn-output weight (rank-3
+     * {@code [nHeads, headDim, embDim]} per Meta's convention OR
+     * rank-2 {@code [nHeads * headDim, embDim]} per bartowski's
+     * flattened export) into SIMD-friendly 2D form
+     * {@code [embDim, nHeads * headDim]}. The byte-offset math is
+     * identical for both ranks: outer stride inside the {@code k}
+     * loop is {@code embDim * 4} bytes regardless of inner rank.
      */
     private static Tensor transposeAttnOut(Tensor src3D, int nHeads, int headDim, int embDim) {
-        Tensor dst = Tensor.allocate2D(DType.FP32, embDim, nHeads * headDim);
+        int totalK = nHeads * headDim;
+        Tensor dst = Tensor.allocate2D(DType.FP32, embDim, totalK);
         MemorySegment src = src3D.data();
         MemorySegment d   = dst.data();
-        long srcStrideH = (long) headDim * embDim * 4L;
-        long srcStrideD = (long) embDim * 4L;
-        long dstStrideR = (long) (nHeads * headDim) * 4L;
-        for (int h = 0; h < nHeads; h++) {
-            long srcHeadBase = (long) h * srcStrideH;
-            for (int dd = 0; dd < headDim; dd++) {
-                long srcDimBase = srcHeadBase + (long) dd * srcStrideD;
-                long dstDimBase = (long) (h * headDim + dd) * 4L;
-                for (int e = 0; e < embDim; e++) {
-                    d.set(ValueLayout.JAVA_FLOAT, (long) e * dstStrideR + dstDimBase,
-                          src.get(ValueLayout.JAVA_FLOAT, srcDimBase + (long) e * 4L));
-                }
+        long srcStrideK = (long) embDim * 4L;
+        long dstStrideR = (long) totalK * 4L;
+        for (int k = 0; k < totalK; k++) {
+            long srcColBase = (long) k * srcStrideK;
+            long dstColBase = (long) k * 4L;
+            for (int e = 0; e < embDim; e++) {
+                d.set(ValueLayout.JAVA_FLOAT, dstColBase + (long) e * dstStrideR,
+                      src.get(ValueLayout.JAVA_FLOAT, srcColBase + (long) e * 4L));
             }
         }
         return dst;

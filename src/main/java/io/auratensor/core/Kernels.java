@@ -252,11 +252,31 @@ public final class Kernels {
         if (qk.dtype() != DType.FP32) {
             throw new IllegalArgumentException("ropeInPlace requires FP32 tensors");
         }
-        int heads = (int) (qk.numElements() / headDim);
-        MemorySegment qseg = qk.data();
-        MemorySegment cseg = cos.data();
-        MemorySegment sseg = sin.data();
+        int n = (int) qk.numElements();
+        ropeInPlaceSegment(qk.data(), cos.data(), sin.data(), headDim, n);
+    }
 
+    /**
+     * SIMD RoPE over raw {@link MemorySegment}s — applies the Llama rotation to
+     * {@code n = numHeads * headDim} Q or K floats in {@code qkSeg}, reading
+     * {@code headDim} cos and sin floats (duplicated per pair) from
+     * {@code cosSeg} / {@code sinSeg}.
+     *
+     * <p>Used by {@link io.auratensor.inference.LlamaModel#layerStep} with
+     * {@link MemorySegment#asSlice} views into the flat ropecache plus the
+     * per-step Q/K scratch buffer, so the inner decode loop makes zero
+     * {@code Arena.ofConfined} / {@code Tensor.wrap} allocations.
+     *
+     * <p>Layout: {@code qkSeg} flat {@code [nHeads * headDim]}; for every head
+     * the same per-position cos/sin row is at {@code [0, headDim)} within
+     * the supplied slice.
+     */
+    public static void ropeInPlaceSegment(MemorySegment qkSeg, MemorySegment cosSeg,
+                                          MemorySegment sinSeg, int headDim, int n) {
+        if ((n % headDim) != 0) {
+            throw new IllegalArgumentException(
+                "ropeInPlaceSegment: n " + n + " is not a multiple of headDim " + headDim);
+        }
         var species = Simd.SPECIES;
         // V = [a_0, b_0, a_1, b_1, ...]            (qk segment stride-1)
         // C = [c_0, c_0, c_1, c_1, ...]            (cos segment stride-1)
@@ -268,6 +288,7 @@ public final class Kernels {
         // a swapped sin vector whose lanes for the (a,b) pair are (s, -s).
         int upper = species.loopBound(headDim);
         FloatVector signMask = SIGN_MASK;  // [-1, +1, -1, +1, ...] baked once.
+        int heads = n / headDim;
 
         for (int h = 0; h < heads; h++) {
             long off = (long) h * headDim * 4L;
@@ -275,9 +296,9 @@ public final class Kernels {
             for (int i = 0; i < upper; i += species.length()) {
                 long bo = off + (long) i * 4L;
 
-                FloatVector V  = FloatVector.fromMemorySegment(species, qseg, bo, ByteOrder.nativeOrder());
-                FloatVector Cv = FloatVector.fromMemorySegment(species, cseg, (long) i * 4L, ByteOrder.nativeOrder());
-                FloatVector Sv = FloatVector.fromMemorySegment(species, sseg, (long) i * 4L, ByteOrder.nativeOrder());
+                FloatVector V  = FloatVector.fromMemorySegment(species, qkSeg, bo, ByteOrder.nativeOrder());
+                FloatVector Cv = FloatVector.fromMemorySegment(species, cosSeg, (long) i * 4L, ByteOrder.nativeOrder());
+                FloatVector Sv = FloatVector.fromMemorySegment(species, sinSeg, (long) i * 4L, ByteOrder.nativeOrder());
 
                 // Signed sin: multiply by [-1, +1, -1, +1] so lane l of pair p
                 // becomes (s = sin_p, -s = -sin_p).
@@ -285,16 +306,16 @@ public final class Kernels {
                 // V * C contributes a*c on lane 0, b*c on lane 1, ...
                 // V_swap contributes -b*s on lane 0, +a*s on lane 1, ...
                 FloatVector out = V.fma(Cv, V.rearrange(SWAP_ADJ).mul(svSigned));
-                out.intoMemorySegment(qseg, bo, ByteOrder.nativeOrder());
+                out.intoMemorySegment(qkSeg, bo, ByteOrder.nativeOrder());
             }
             for (int i = upper; i < headDim; i += 2) {
                 long bo = off + (long) i * 4L;
-                float a = qseg.get(ValueLayout.JAVA_FLOAT, bo);
-                float b = qseg.get(ValueLayout.JAVA_FLOAT, bo + 4);
-                float c = cseg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L);
-                float s = sseg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L);
-                qseg.set(ValueLayout.JAVA_FLOAT, bo, a * c - b * s);
-                qseg.set(ValueLayout.JAVA_FLOAT, bo + 4, a * s + b * c);
+                float a = qkSeg.get(ValueLayout.JAVA_FLOAT, bo);
+                float b = qkSeg.get(ValueLayout.JAVA_FLOAT, bo + 4);
+                float c = cosSeg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L);
+                float s = sinSeg.get(ValueLayout.JAVA_FLOAT, (long) i * 4L);
+                qkSeg.set(ValueLayout.JAVA_FLOAT, bo, a * c - b * s);
+                qkSeg.set(ValueLayout.JAVA_FLOAT, bo + 4, a * s + b * c);
             }
         }
     }

@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -18,6 +19,34 @@ import java.util.List;
  * in the mapped MemorySegment and are reached by byte offsets.
  *
  * <p>Supports GGUF version 3 (current Llama.cpp / Llama 3 exports).
+ *
+ * <p><b>Alignment convention</b> — GGUF v3 spec stores all metadata
+ * field bytes (key length, key bytes, value-type int, value bytes) and
+ * tensor info field bytes (name, nDims, dims, typeCode, offset) BACK-TO-BACK
+ * with <b>no</b> padding between them. The spec REMOVED the v1/v2
+ * zero-pad-to-8-byte convention that was applied between fields; only
+ * the data-section offset honours a configurable per-file alignment
+ * declared in metadata (typically 32 or 256 bytes; default 32).
+ *
+ * <p><b>Misalignment-safe reads</b> — because the runtime padding-free
+ * layout means successive reads land on byte positions that are
+ * unpredictable from FFM's {@code ValueLayout} alignment constraints,
+ * every multi-byte read in this parser uses {@link #readInt},
+ * {@link #readLong}, or {@link #readShort} helpers that copy raw bytes
+ * via {@link MemorySegment#copy} and assemble the little-endian value
+ * manually. This bypasses {@link MemorySegment#get}'s alignment
+ * preconditions outright, so a read at any byte position is correct
+ * regardless of preceding variable-length fields.
+ *
+ * <p><b>Historical bug (now fixed)</b> — earlier revisions of this
+ * parser added {@code c.pos = (c.pos + 7L) & ~7L;} round-ups that
+ * skipped 1­–7 bytes of real GGUF content. The resulting misaligned
+ * {@code readLong} consumed string bytes ("nnnnnnn p" ≈
+ * {@code 0x6E6E6E6E6E6E6E70}) and decoded them as the bogus long
+ * {@code 7,954,877,566,517,510,144}, igniting
+ * {@code IndexOutOfBoundsException} or tripping plausibility checks
+ * at huge offsets. With byte-copy readers, ALL round-ups become
+ * no-ops and the parser follows GGUF bytes verbatim.
  */
 public final class GgufFile implements AutoCloseable {
 
@@ -90,10 +119,11 @@ public final class GgufFile implements AutoCloseable {
         long tensorCount = readLong(mapped, 8);
         long metadataKvCount = readLong(mapped, 16);
 
+        // GGUF v3 spec: KV metadata fields are tightly packed (no
+        // inter-field padding). The byte-copy readers handle consequential
+        // unaligned positions correctly without any c.pos round-up.
         Cursor cur = new Cursor(24);
         GgufMetadata meta = parseMetadata(mapped, cur, metadataKvCount);
-
-        cur.pos = align32(cur.pos);
 
         int n = (int) tensorCount;
         List<GgufTensorInfo> infos = new ArrayList<>(n);
@@ -101,10 +131,15 @@ public final class GgufFile implements AutoCloseable {
             infos.add(parseTensorInfo(mapped, cur));
         }
 
-        long dataStart = align32(cur.pos);
+        // GGUF v3 spec: tensor data section begins at the per-file
+        // alignment declared in metadata (default 32). GGUF v3 made this
+        // per-file configurable; older hardcoded align32 caused IOOBE
+        // on files with 64- or 256-byte alignment.
+        long alignment = meta.longOrDefault("general.alignment", 32L);
+        long dataOffset = alignUp(cur.pos, alignment);
 
         return new GgufFile(raf, ch, mapped, arena, version, tensorCount, metadataKvCount,
-                            meta, infos, dataStart, fileLen);
+                            meta, infos, dataOffset, fileLen);
     }
 
     public int version() { return version; }
@@ -118,8 +153,15 @@ public final class GgufFile implements AutoCloseable {
 
     /** Returns a slice of the mmap region corresponding to a single tensor's raw bytes. */
     public MemorySegment tensorData(GgufTensorInfo info) {
-        long start = dataOffset + info.offset();
         long len = info.byteSize();
+        if (len <= 0 || info.type().bytesPerBlockOrElement < 0) {
+            throw new UnsupportedOperationException(
+                "Gguf tensor type " + info.type().label + " for tensor '" + info.name()
+                + "' is not yet implemented by AuraTensor (bytesPerBlockOrElement="
+                + info.type().bytesPerBlockOrElement + ", byteSize=" + len + "). "
+                + "Supported: F32, F16, Q4_0, Q8_0. Use a different export (e.g. all-Q4_0).");
+        }
+        long start = dataOffset + info.offset();
         return mapped.asSlice(start, len);
     }
 
@@ -133,7 +175,10 @@ public final class GgufFile implements AutoCloseable {
     }
 
     // ---------------------------------------------------------------------
-    // Parsing helpers
+    // Misalignment-safe byte-copy readers — GGUF fields are tightly packed
+    // per spec, so reads can land on any byte offset. We bypass the FFM
+    // alignment preconditions by copying raw bytes and assembling
+    // little-endian values manually.
     // ---------------------------------------------------------------------
 
     private static final class Cursor {
@@ -141,24 +186,53 @@ public final class GgufFile implements AutoCloseable {
         Cursor(long pos) { this.pos = pos; }
     }
 
+    /** Read a little-endian int at any offset (no alignment constraint). */
     private static int readInt(MemorySegment s, long off) {
-        return s.get(java.lang.foreign.ValueLayout.JAVA_INT, off);
+        byte[] b = new byte[4];
+        MemorySegment.copy(s, off, MemorySegment.ofArray(b), 0L, 4L);
+        return (b[0] & 0xFF)
+             | ((b[1] & 0xFF) <<  8)
+             | ((b[2] & 0xFF) << 16)
+             | ((b[3] & 0xFF) << 24);
     }
 
+    /** Read a little-endian long at any offset (no alignment constraint). */
     private static long readLong(MemorySegment s, long off) {
-        return s.get(java.lang.foreign.ValueLayout.JAVA_LONG, off);
+        byte[] b = new byte[8];
+        MemorySegment.copy(s, off, MemorySegment.ofArray(b), 0L, 8L);
+        return (b[0] & 0xFFL)
+             | ((b[1] & 0xFFL) <<  8)
+             | ((b[2] & 0xFFL) << 16)
+             | ((b[3] & 0xFFL) << 24)
+             | ((b[4] & 0xFFL) << 32)
+             | ((b[5] & 0xFFL) << 40)
+         | ((b[6] & 0xFFL) << 48)
+             | ((b[7] & 0xFFL) << 56);
     }
 
-    private static long align32(long v) {
-        return ((v + 31L) / 32L) * 32L;
+    /** Read a little-endian short at any offset (no alignment constraint). */
+    private static int readShort(MemorySegment s, long off) {
+        byte[] b = new byte[2];
+        MemorySegment.copy(s, off, MemorySegment.ofArray(b), 0L, 2L);
+        return (b[0] & 0xFF) | ((b[1] & 0xFF) << 8);
+    }
+
+    /** Round up to the next multiple of `align`. The GGUF v3 spec
+     *  defines tensor-data alignment via `general.alignment` metadata
+     *  (default 32 on legacy writers; many modern exports use 64 or 256
+     *  for mmap page alignment efficiency). */
+    private static long alignUp(long v, long align) {
+        return ((v + align - 1L) / align) * align;
     }
 
     private static String readLengthPrefixedString(MemorySegment s, Cursor c, byte[] scratch) {
         long len = readLong(s, c.pos);
         c.pos += 8;
+        if (len < 0 || len > Integer.MAX_VALUE) {
+            throw new IllegalStateException("Implausible string length: " + len
+                + " at offset " + (c.pos - 8));
+        }
         byte[] buf = (len > scratch.length) ? new byte[(int) len] : scratch;
-        // Stable segment-to-segment copy via MemorySegment.ofArray(buf) —
-        // works on JDK 22+ FFM without requiring ValueLayout-specific overloads.
         MemorySegment.copy(
             s, c.pos,
             MemorySegment.ofArray(buf), 0L,
@@ -170,17 +244,11 @@ public final class GgufFile implements AutoCloseable {
     private static GgufMetadata parseMetadata(MemorySegment s, Cursor c, long count) {
         GgufMetadata out = new GgufMetadata();
         byte[] scratch = new byte[1024];
+        // Spec: KV fields are tightly packed — no inter-KV padding.
         for (long i = 0; i < count; i++) {
             String key = readLengthPrefixedString(s, c, scratch);
-
-            // GGUF v3 spec: align each KV key's read position to 8 bytes so
-            // the value-type int read below lands on an int-aligned offset.
-            c.pos = (c.pos + 7L) & ~7L;
-
             int vtCode = readInt(s, c.pos);
             c.pos += 4;
-            // GGUF v3 spec: align pos to 8 before reading the value (long/etc.).
-            c.pos = (c.pos + 7L) & ~7L;
             GgufMetadataValueType vt = GgufMetadataValueType.fromCode(vtCode);
             Object value = readValue(s, c, vt, scratch);
             out.put(key, value);
@@ -191,24 +259,29 @@ public final class GgufFile implements AutoCloseable {
     private static Object readValue(MemorySegment s, Cursor c,
                                     GgufMetadataValueType vt, byte[] scratch) {
         switch (vt) {
-            case UINT8:  { long v = s.get(java.lang.foreign.ValueLayout.JAVA_BYTE, c.pos) & 0xFFL; c.pos += 1; return v; }
-            case INT8:   { long v = s.get(java.lang.foreign.ValueLayout.JAVA_BYTE, c.pos);      c.pos += 1; return v; }
-            case UINT16: { long v = s.get(java.lang.foreign.ValueLayout.JAVA_SHORT, c.pos) & 0xFFFFL; c.pos += 2; return v; }
-            case INT16:  { long v = s.get(java.lang.foreign.ValueLayout.JAVA_SHORT, c.pos);     c.pos += 2; return v; }
-            case UINT32: { long v = s.get(java.lang.foreign.ValueLayout.JAVA_INT, c.pos) & 0xFFFFFFFFL; c.pos += 4; return v; }
-            case INT32:  { long v = s.get(java.lang.foreign.ValueLayout.JAVA_INT, c.pos);       c.pos += 4; return v; }
-            case UINT64: { long v = s.get(java.lang.foreign.ValueLayout.JAVA_LONG, c.pos);      c.pos += 8; return v; }
-            case INT64:  { long v = s.get(java.lang.foreign.ValueLayout.JAVA_LONG, c.pos);      c.pos += 8; return v; }
-            case FLOAT32:{ float v = s.get(java.lang.foreign.ValueLayout.JAVA_FLOAT, c.pos);    c.pos += 4; return v; }
-            case FLOAT64:{ double v = s.get(java.lang.foreign.ValueLayout.JAVA_DOUBLE, c.pos);  c.pos += 8; return v; }
-            case BOOL:   { byte b = s.get(java.lang.foreign.ValueLayout.JAVA_BYTE, c.pos);      c.pos += 1; return b != 0; }
+            case UINT8:  { long v = s.get(ValueLayout.JAVA_BYTE, c.pos) & 0xFFL; c.pos += 1; return v; }
+            case INT8:   { long v = s.get(ValueLayout.JAVA_BYTE, c.pos);      c.pos += 1; return v; }
+            case UINT16: { long v = readShort(s, c.pos) & 0xFFFFL;            c.pos += 2; return v; }
+            case INT16:  { long v = (short) readShort(s, c.pos);              c.pos += 2; return v; }
+            case UINT32: { long v = readInt(s, c.pos) & 0xFFFFFFFFL;          c.pos += 4; return v; }
+            case INT32:  { long v = readInt(s, c.pos);                        c.pos += 4; return v; }
+            case UINT64: { long v = readLong(s, c.pos);                       c.pos += 8; return v; }
+            case INT64:  { long v = readLong(s, c.pos);                       c.pos += 8; return v; }
+            case FLOAT32:{ int ibits = readInt(s, c.pos);                     c.pos += 4; return Float.intBitsToFloat(ibits); }
+            case FLOAT64:{ long lbits = readLong(s, c.pos);                   c.pos += 8; return Double.longBitsToDouble(lbits); }
+            case BOOL:   { byte b = s.get(ValueLayout.JAVA_BYTE, c.pos);      c.pos += 1; return b != 0; }
             case STRING: { return readLengthPrefixedString(s, c, scratch); }
             case ARRAY: {
+                // GGUF v3 spec: ARRAY elements are tightly packed.
                 int elemTypeCode = readInt(s, c.pos);
                 c.pos += 4;
                 GgufMetadataValueType elemType = GgufMetadataValueType.fromCode(elemTypeCode);
                 long len = readLong(s, c.pos);
                 c.pos += 8;
+                if (len < 0 || len > 1 << 26) {
+                    throw new IllegalStateException("Implausible array length: " + len
+                        + " at offset " + (c.pos - 8));
+                }
                 List<Object> list = new ArrayList<>((int) len);
                 for (long i = 0; i < len; i++) {
                     list.add(readValue(s, c, elemType, scratch));
@@ -222,8 +295,8 @@ public final class GgufFile implements AutoCloseable {
 
     private static GgufTensorInfo parseTensorInfo(MemorySegment s, Cursor c) {
         byte[] scratch = new byte[256];
+        // GGUF v3 spec: tensor info fields are tightly packed (no padding).
         String name = readLengthPrefixedString(s, c, scratch);
-
         int nDims = readInt(s, c.pos);
         c.pos += 4;
         if (nDims < 1 || nDims > 4) {
