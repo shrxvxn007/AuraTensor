@@ -7,6 +7,7 @@ import io.auratensor.format.GgufFile;
 import io.auratensor.format.GgufTensorInfo;
 import io.auratensor.format.GgufTensorType;
 import io.auratensor.quant.Q4_0;
+import io.auratensor.quant.Q6_K;
 import io.auratensor.quant.Q8_0;
 
 import java.lang.foreign.MemorySegment;
@@ -195,8 +196,21 @@ public final class Weights {
                 Q8_0.dequantToFloat(raw, dest.data(), info.numElements());
                 yield dest;
             }
+            case Q6_K -> {
+                // Q6_K is the k-quant 6-bit format used for `token_embd.weight`
+                // and `output.weight` in bartowski's Llama-3 GGUF files. Without
+                // this case, those tensors silently fall back to an empty FP32
+                // stand-in and the model emits zero embeddings + zero logits (not
+                // just constant logits — literally zero, which NaN-poisons the
+                // first matmul). Dequant mirrors llama.cpp's `dequantize_row_q6_K`
+                // exactly: ql + qh + scales[16] + d = 210 bytes / 256 elements,
+                // 16 elements per scale, 4-way interleaved byte addressing.
+                Tensor dest = Tensor.allocate(DType.FP32, shape);
+                Q6_K.dequantToFloat(raw, dest.data(), info.numElements());
+                yield dest;
+            }
             default -> {
-                // Unsupported quantization (Q5_*/Q6_K/Q8_K etc.) fall back
+                // Unsupported quantization (Q5_*/Q8_K/Q2_K..Q5_K etc.) fall back
                 // to an empty stand-in so the forward pass doesn't crash on
                 // architectures we haven't wired up yet.
                 yield Tensor.allocate(DType.FP32, shape);

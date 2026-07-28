@@ -25,7 +25,7 @@ public enum GgufTensorType {
     Q3_K     (11, -1, "Q3_K"),
     Q4_K     (12, -1, "Q4_K"),
     Q5_K     (13, -1, "Q5_K"),
-    Q6_K     (14, -1, "Q6_K"),
+    Q6_K     (14, 210, "Q6_K"),    // 256 elements per block (128 ql + 64 qh + 16 scales + 2 d bytes)
     Q8_K     (15, -1, "Q8_K");
 
     /** GGUF code (matches the byte in the file). */

@@ -120,6 +120,19 @@ java \
   --repeat-penalty 1.1
 ```
 
+Or skip the JVM flags entirely with the bundled `bin/auratensor` wrapper
+(which auto-injects `--add-modules jdk.incubator.vector
+--enable-native-access=ALL-UNNAMED`, resolves the shaded jar relative to
+its own location, and prepends `$JAVA_OPTS` before the required JVM
+flags if you set it):
+
+```bash
+./bin/auratensor \
+  --model llama3-8b.Q4_0.gguf \
+  --prompt "Explain quantum computing in two paragraphs" \
+  --tokens 256 --temperature 0.7 --top-k 40 --top-p 0.95 --repeat-penalty 1.1
+```
+
 ### 3. Launch the OpenAI-compatible HTTP server
 
 ```bash
@@ -270,12 +283,14 @@ warmup/measurement annotations.
 
 ⁴ Read end-to-end with auto-download of the Llama-3.2-1B-Instruct-Q4_0
 GGUF model (Hugging Face bartowski/Llama-3.2-1B-Instruct-Q4_0-GGUF) via
-TokenThroughputBenchmark's real-model path. Per-tensor fallback for
-unsupported quant types (this file's `token_embd.weight` and
-`output.weight` are stored as Q6_K — AuraTensor skips dequant for
-Q6_K and substitutes an empty FP32 stand-in so `forwardStep` runs
-end-to-end on the real 1B shapes; the F32, F16, Q4_0, and Q8_0 weights
-that drive the hot SIMD matvec path all dequant to real values).
+TokenThroughputBenchmark's real-model path. `token_embd.weight` and
+`output.weight` are stored as Q6_K (the k-quant 6-bit format favoured
+by bartowski) — AuraTensor now decodes them via `Q6_K.dequantToFloat`,
+matching the canonical llama.cpp `dequantize_row_q6_K` block layout
+(ql + qh + scales + d = 210 bytes / 256 elements with 16 elements per
+scale, 4-way interleaved byte addressing). The F32, F16, Q4_0, Q8_0,
+and Q6_K weights that drive the hot SIMD matvec path all dequant to
+real values; no per-tensor fallback remains for these quant types.
 
 ⁵ The full ctx sweep on real 1.2B Q4_0 weights was run end-to-end with
 JMH default `@Warmup(3, 2s)` + `@Measurement(5, 3s)` annotations —
