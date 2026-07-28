@@ -27,15 +27,21 @@ public record GgufTensorInfo(
     public long byteSize() {
         long elems = numElements();
         // Block-quantized types: ceil(elems / blockElems) blocks, each of
-        // bytesPerBlockOrElement bytes. The standard 32-element block size
-        // applies to all k-quants that store per-32-element scale + nibble
-        // packs (Q4_0 = 18 B, Q4_1 = 20 B, Q5_0 = 22 B, Q5_1 = 24 B,
-        // Q8_0 = 34 B, Q8_1 = 36 B). Q6_K is the outlier: it stores 256
-        // elements per super-block (ql + qh + scales + d = 210 B) and would
-        // be over-counted by 8× if the 32-element formula were applied.
+        // bytesPerBlockOrElement bytes. Two block-size buckets:
+        //   * 32-element blocks (Q4_0 = 18 B, Q4_1 = 20 B, Q5_0 = 22 B,
+        //     Q5_1 = 24 B, Q8_0 = 34 B, Q8_1 = 36 B) — every legacy Q*_0/Q*_1
+        //     variant.
+        //   * 256-element super-blocks (Q2_K = 84 B, Q3_K = 110 B, Q4_K = 148 B,
+        //     Q5_K = 180 B, Q6_K = 210 B, Q8_K = 260 B) — every k-quant.
+        //     Using the 32-element formula on a 256-element super-block
+        //     is over-counted by 8× and trips IOOBE on `MappedMemorySegment
+        //     .asSlice(start, len)`.
         // Non-block types (F32, F16): per-element bytes.
         if (type.isBlockQuantized()) {
-            int blockElems = (type == GgufTensorType.Q6_K) ? 256 : 32;
+            int blockElems = switch (type) {
+                case Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K -> 256;
+                default -> 32;
+            };
             return ((elems + blockElems - 1L) / blockElems) * type.bytesPerBlockOrElement;
         }
         return elems * type.bytesPerBlockOrElement;

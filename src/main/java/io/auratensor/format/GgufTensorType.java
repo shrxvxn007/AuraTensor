@@ -21,12 +21,12 @@ public enum GgufTensorType {
     Q5_1     (7, 24, "Q5_1"),
     Q8_0     (8, 34, "Q8_0"),    // 32 elements per block
     Q8_1     (9, 36, "Q8_1"),
-    Q2_K     (10, -1, "Q2_K"),
-    Q3_K     (11, -1, "Q3_K"),
-    Q4_K     (12, -1, "Q4_K"),
-    Q5_K     (13, -1, "Q5_K"),
+    Q2_K     (10,  84, "Q2_K"),    // 256 elements per block (16 scales[sc|m nibble] + 64 qs[2-bit] + 2 dmin fp16 + 2 d fp16)
+    Q3_K     (11, 110, "Q3_K"),    // 256 elements per block (32 hmask[1-bit] + 64 qs[2-bit] + 12 scales[6-bit packed] + 2 d fp16)
+    Q4_K     (12, 148, "Q4_K"),    // 256 elements per block (2 d + 2 dmin + 16 scales[sc|m nibble] + 128 qs[4-bit])
+    Q5_K     (13, 180, "Q5_K"),    // 256 elements per block (2 d + 2 dmin + 16 scales + 32 qh[1-bit] + 128 qs[4-bit])
     Q6_K     (14, 210, "Q6_K"),    // 256 elements per block (128 ql + 64 qh + 16 scales + 2 d bytes)
-    Q8_K     (15, -1, "Q8_K");
+    Q8_K     (15, 260, "Q8_K");    // 256 elements per block (4 d fp32 + 256 qs[i8])
 
     /** GGUF code (matches the byte in the file). */
     public final int code;

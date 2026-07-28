@@ -6,9 +6,14 @@ import io.auratensor.core.Tensor;
 import io.auratensor.format.GgufFile;
 import io.auratensor.format.GgufTensorInfo;
 import io.auratensor.format.GgufTensorType;
+import io.auratensor.quant.Q2_K;
+import io.auratensor.quant.Q3_K;
 import io.auratensor.quant.Q4_0;
+import io.auratensor.quant.Q4_K;
+import io.auratensor.quant.Q5_K;
 import io.auratensor.quant.Q6_K;
 import io.auratensor.quant.Q8_0;
+import io.auratensor.quant.Q8_K;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -209,10 +214,53 @@ public final class Weights {
                 Q6_K.dequantToFloat(raw, dest.data(), info.numElements());
                 yield dest;
             }
+            case Q2_K -> {
+                // Q2_K is the most aggressive of the k-quants (~3.5 bits/weight)
+                // favoured by ollama / bartowski / unsloth when storage cost is the
+                // primary constraint. 4-way interleaved byte addressing with dmin
+                // subtraction and a 4-bit-per-nibble scales byte. 84 B/block.
+                Tensor dest = Tensor.allocate(DType.FP32, shape);
+                Q2_K.dequantToFloat(raw, dest.data(), info.numElements());
+                yield dest;
+            }
+            case Q3_K -> {
+                // Q3_K is the ~3.5-bit asymmetric format with a 6-bit-per-byte
+                // packed scale. The h-bit in `hmask` controls the high-1 of each 3-bit
+                // q, and when 0 forces an asymmetric q ⇒ q−4 fixup to break out of
+                // the −8 (byte sign-extended) tiebreaker. 110 B/block.
+                Tensor dest = Tensor.allocate(DType.FP32, shape);
+                Q3_K.dequantToFloat(raw, dest.data(), info.numElements());
+                yield dest;
+            }
+            case Q4_K -> {
+                // Q4_K is the dominant mid-tier 4-bit k-quant for Llama-3 / Mid-tier
+                // bartowski GGUF exports. 4-bit qs + 4-bit sc | 4-bit m scales
+                // (with the canonical get_scale_min_k4 high-2-bit-spill quirk).
+                // 148 B/block.
+                Tensor dest = Tensor.allocate(DType.FP32, shape);
+                Q4_K.dequantToFloat(raw, dest.data(), info.numElements());
+                yield dest;
+            }
+            case Q5_K -> {
+                // Q5_K is the 5-bit k-quant above Q4_K accuracy and below Q6_K,
+                // adding a `qh[32]` byte for the high-1 bit of each 5-bit q.
+                // u1/u2 mask increment by 2 per 64-element j-step. 180 B/block.
+                Tensor dest = Tensor.allocate(DType.FP32, shape);
+                Q5_K.dequantToFloat(raw, dest.data(), info.numElements());
+                yield dest;
+            }
+            case Q8_K -> {
+                // Q8_K is the highest-fidelity of the k-quants: 256 signed-int8
+                // qs with one FP32 (no FP16 round-trip) super-block scale. Linear
+                // 0..255 sweep with no interleaving. 260 B/block.
+                Tensor dest = Tensor.allocate(DType.FP32, shape);
+                Q8_K.dequantToFloat(raw, dest.data(), info.numElements());
+                yield dest;
+            }
             default -> {
-                // Unsupported quantization (Q5_*/Q8_K/Q2_K..Q5_K etc.) fall back
-                // to an empty stand-in so the forward pass doesn't crash on
-                // architectures we haven't wired up yet.
+                // Unsupported quantization (Q4_1/Q5_0/Q5_1/Q8_1) — legacy
+                // 32-element-block variants — falls back to an empty stand-in
+                // so the forward pass doesn't crash on these architectures.
                 yield Tensor.allocate(DType.FP32, shape);
             }
         };
