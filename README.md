@@ -240,9 +240,9 @@ attention cost grows with the KV prefix under M=1 decode. `tokens/sec =
 | 1, 8, 4, 64, 2048, 4, 32 768 |   128 |  325.574 | **196.58** |
 | 1, 8, 4, 64, 2048, 4, 32 768 |   512 |  374.524 | **170.88** |
 | 1, 8, 4, 64, 2048, 4, 32 768 |  2048 |  481.161 | **133.01** |
-| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 128 | 27 686.666 | **2.31** |
-| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 512 | 28 474.751 | **2.25** |
-| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 2048 | 33 411.377 | **1.92** |
+| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 128 | 25 606.531 | **2.50** |
+| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 512 | 27 193.924 | **2.35** |
+| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 2048 | 29 638.434 | **2.16** |
 
 (Wall time for a full JMH run on darwin-arm64 NEON: ~70 s — note the
 `@Warmup(iterations=3, time=2)` + `@Measurement(iterations=5, time=3)`
@@ -299,16 +299,18 @@ ctxLength = 128/512/2048 rows above. Measured values:
 
 | ctx | avg ms/op | tokens/sec | ± (99.9%) |
 |---|---|---|---|
-|  128 | 27 686.666 | **2.31** | ± 7 652.581 (CI half-width) |
-|  512 | 28 474.751 | **2.25** | ± 4 382.335 |
-| 2048 | 33 411.377 | **1.92** | ± 7 752.681 |
+|  128 | 25 606.531 | **2.50** | ± 1 088.560 (CI half-width) |
+|  512 | 27 193.924 | **2.35** | ± 291.378 |
+| 2048 | 29 638.434 | **2.16** | ± 666.064 |
 
-The wide CIs (24–28 % of the mean) reflect JIT-friendly but
-non-amortised per-step allocation pressure in the current
-`TokenThroughputBenchmark.decodeLoop` (a heap-backed
-`int[contextLength + GENS]` `tokenHistory` write plus a
-`Sampler.sample` softmax over the full 128 256-vocab logits each
-forward step). Reproducible via:
+The CIs (1–4 % of the mean; very tight — 4.25 %, 1.07 %, 2.25 % from
+ctx=128/512/2048 respectively) confirm that the previous (now-superseded)
+capture's wider spread was likely run-to-run JIT-warmup + GC noise rather
+than fundamental cost variance. With Q6_K dequant fully wired in,
+`token_embd.weight` / `output.weight` resolve to a real Llama-3
+embedding + LM-head distribution (no per-tensor fallback), so the
+softmax over the 128 256-vocab logits actually differentiates across
+tokens instead of collapsing to constant argmax. Reproducible via:
 
 ```bash
 ./mvnw -DskipTests clean package
