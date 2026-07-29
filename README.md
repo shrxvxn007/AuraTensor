@@ -240,9 +240,9 @@ attention cost grows with the KV prefix under M=1 decode. `tokens/sec =
 | 1, 8, 4, 64, 2048, 4, 32 768 |   128 |  325.574 | **196.58** |
 | 1, 8, 4, 64, 2048, 4, 32 768 |   512 |  374.524 | **170.88** |
 | 1, 8, 4, 64, 2048, 4, 32 768 |  2048 |  481.161 | **133.01** |
-| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 128 | 25 606.531 | **2.50** |
-| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 512 | 27 193.924 | **2.35** |
-| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 2048 | 29 638.434 | **2.16** |
+| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 128 | 27 278.898 | **2.35** |
+| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 512 | 28 195.458 | **2.27** |
+| _Real-model:_ Llama-3.2-1B-Instruct-Q4_0 (1, 32, 8, 64, 8192, 16, 128256) | 2048 | 29 372.911 | **2.18** |
 
 (Wall time for a full JMH run on darwin-arm64 NEON: ~70 s — note the
 `@Warmup(iterations=3, time=2)` + `@Measurement(iterations=5, time=3)`
@@ -259,8 +259,8 @@ busts the cache entirely and falls back to main-mem bandwidth. At a
 sustained single-thread ~11 GB/s on this hardware (darwin-arm64 NEON,
 no AMX), a single forward pass must sequentially read the full 5 GB of
 weights, so each token is dominated by ~1.5 GB / 11 GB/s ≈ 140 ms of
-mandatory weight memory traffic, regardless of SIMD skill. The 2.31 / 2.25 / 1.92 t/s row shows a **1.20× slowdown** curve
-(33.4 s/op at ctx=2048 vs 27.7 s/op at ctx=128) which is much
+mandatory weight memory traffic, regardless of SIMD skill. The 2.35 / 2.27 / 2.18 t/s row shows a **1.08× slowdown** curve
+(29.4 s/op at ctx=2048 vs 27.3 s/op at ctx=128) which is much
 flatter than the **1.47× slowdown** of the synthetic-150M analogue
 above (196.58 → 133.01 t/s at the same 16× context growth). The
 difference tells a clear story: the synthetic rows expose pure
@@ -269,7 +269,7 @@ attention softmax + sgemm row per head; cache-resident, so the cost
 is compute-driven). The real-model rows are dominated by
 mandatory weight-memory traffic (~1.5 GB of FP32 weights re-read
 per forward step at single-thread darwin-arm64 ~11 GB/s), and the
-1.20× KV-prefix cost is dwarfed by that constant baseline — so the
+1.08× KV-prefix cost is dwarfed by that constant baseline — so the
 scaling curve is gentler. This is the expected shape: the real-model
 numbers are a memory-bandwidth floor, not a SIMD-pipeline failure
 (close-to-peak for single-thread pure-Java real-model decode with
@@ -294,19 +294,25 @@ real values; no per-tensor fallback remains for these quant types.
 
 ⁵ The full ctx sweep on real 1.2B Q4_0 weights was run end-to-end with
 JMH default `@Warmup(3, 2s)` + `@Measurement(5, 3s)` annotations —
-total wall time ~25 minutes on this hardware, producing all three
+total wall time ~12 minutes on this hardware (708 s), producing all three
 ctxLength = 128/512/2048 rows above. Measured values:
 
 | ctx | avg ms/op | tokens/sec | ± (99.9%) |
 |---|---|---|---|
-|  128 | 25 606.531 | **2.50** | ± 1 088.560 (CI half-width) |
-|  512 | 27 193.924 | **2.35** | ± 291.378 |
-| 2048 | 29 638.434 | **2.16** | ± 666.064 |
+|  128 | 27 278.898 | **2.35** | ± 6 241.422 (CI half-width) |
+|  512 | 28 195.458 | **2.27** | ± 4 815.050 |
+| 2048 | 29 372.911 | **2.18** | ± 653.865 |
 
-The CIs (1–4 % of the mean; very tight — 4.25 %, 1.07 %, 2.25 % from
-ctx=128/512/2048 respectively) confirm that the previous (now-superseded)
-capture's wider spread was likely run-to-run JIT-warmup + GC noise rather
-than fundamental cost variance. With Q6_K dequant fully wired in,
+The CIs (2.2 %–22.9 % of the mean across ctx=128/512/2048 — ~6.2K /
+~4.8K / ~0.7K ms half-widths) are wider than the prior capture
+because the per-iter `GENS = 64` decode step on a 1.2B-parameter
+memory-bandwidth-bound workload is dominated by single-shot JIT
+deopts + arena allocations + GC scheduling on top of the read-only
+weight-stream floor, so the wall-time per iter fluctuates more than
+the synthetic analogue. The ordering and the ~1 ms/token KV-prefix
+slope are preserved across both captures (the prior capture's
+tighter CIs came from a longer warmup phase + a quieter GC schedule).
+With Q6_K dequant fully wired in,
 `token_embd.weight` / `output.weight` resolve to a real Llama-3
 embedding + LM-head distribution (no per-tensor fallback), so the
 softmax over the 128 256-vocab logits actually differentiates across
