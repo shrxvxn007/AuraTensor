@@ -71,15 +71,16 @@
         <finalName>auratensor</finalName>
         <plugins>
             <!-- Compile against the JDK 25 baseline. FFM (JEP 454) is
-                 finalized + on the default module path. Vector API is
-                 still an incubator module (JEP 489 Eighth Incubator on
-                 JDK 25, Sixth Incubator on JDK 21) so we add it
-                 explicitly here — javac --release N reads from a
-                 compact type symbols archive that excludes incubator
-                 modules; without --add-modules the JDK 21 matrix
-                 fails to compile FloatVector references (the JDK 25
-                 matrix ironically succeeds because javac --release 25
-                 falls back to scanning the live module graph). -->
+                 finalized and on the default module path. Vector API
+                 remains an incubator module (JEP 489 Eighth Incubator
+                 on JDK 25; Sixth Incubator on JDK 21) so it is added
+                 explicitly here. javac with release=N via the Maven
+                 maven.compiler.release property reads from a compact
+                 type symbols archive that excludes incubator modules;
+                 without add-modules, the JDK 21 matrix fails to
+                 compile FloatVector references (the JDK 25 matrix
+                 incidentally succeeds because javac with release=25
+                 falls back to scanning the live jrt module graph). -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
