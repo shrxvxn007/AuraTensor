@@ -1,6 +1,6 @@
 # AuraTensor
 
-[![CI status](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml/badge.svg)](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml)
+[![CI status](https://github.com/shrxvxn007/AuraTensor/workflows/CI/badge.svg)](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 ![Java 25+](https://img.shields.io/badge/Java-25%2B-orange.svg)
 ![Zero runtime deps](https://img.shields.io/badge/zero-runtime-deps-brightgreen.svg)
@@ -28,7 +28,7 @@ The result: a single self-contained `auratensor.jar` that you can run on any Lin
 
 ## 📊 Status & Verifiability
 
-[![CI status](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml/badge.svg)](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml)
+[![CI status](https://github.com/shrxvxn007/AuraTensor/workflows/CI/badge.svg)](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml)
 The pipeline runs `./mvnw clean test` on every push (Ubuntu ×
 {Temurin JDK 21, Temurin JDK 25}) plus a programmatic JMH smoke
 iteration on the synthetic bench shape.

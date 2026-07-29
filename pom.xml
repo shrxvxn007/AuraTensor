@@ -70,8 +70,16 @@
     <build>
         <finalName>auratensor</finalName>
         <plugins>
-            <!-- Compile against the JDK 25 baseline. Both FFM and Vector API
-                 are finalized at this point; no add-modules needed. -->
+            <!-- Compile against the JDK 25 baseline. FFM (JEP 454) is
+                 finalized + on the default module path. Vector API is
+                 still an incubator module (JEP 489 Eighth Incubator on
+                 JDK 25, Sixth Incubator on JDK 21) so we add it
+                 explicitly here — javac --release N reads from a
+                 compact type symbols archive that excludes incubator
+                 modules; without --add-modules the JDK 21 matrix
+                 fails to compile FloatVector references (the JDK 25
+                 matrix ironically succeeds because javac --release 25
+                 falls back to scanning the live module graph). -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
@@ -87,6 +95,8 @@
                     </annotationProcessorPaths>
                     <compilerArgs>
                         <arg>-Xlint:-options</arg>
+                        <arg>--add-modules</arg>
+                        <arg>jdk.incubator.vector</arg>
                     </compilerArgs>
                 </configuration>
             </plugin>
