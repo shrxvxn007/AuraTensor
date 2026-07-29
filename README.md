@@ -498,6 +498,51 @@ java -jar auratensor.jar --model model.gguf --prompt "..."
 
 ---
 
+## ⚠️ Limitations
+
+AuraTensor targets **Llama 3 / Mistral on darwin-arm64 + linux-x86_64
+with SIMD-only CPU inference**. Features llama.cpp has that we don't —
+in priority-of-impact order:
+
+1. **Speculative decoding** — no draft-model pipeline, n-gram lookup,
+   Medusa / Lookahead / Prompt Lookup. `Sampler` is greedy / top-K /
+   top-P / temperature / repetition-penalty only; no draft-tree verify.
+2. **KV-cache quantization** — K/V stay FP32 throughout inference. No
+   `--cache-type-k q8_0` / `--cache-type-v q4_0` family. The Q8_0 / Q4_0
+   dequant kernels in `quant/` are reusable shards if you pick this up.
+3. **GPU / Metal / CUDA** — strictly `FloatVector.SPECIES_PREFERRED` on
+   host CPU (NEON on darwin-arm64, AVX-2/AVX-512 on x86_64). Zero
+   GPU / OpenCL / Metal / WebGPU backend anywhere.
+4. **IQ k-quants** — importance-matrix IQ1_S / IQ1_M / IQ2_XXS / IQ2_S /
+   IQ2_M / IQ3_XXS / IQ3_S / IQ4_NL / IQ4_XS are parsed-but-not-dequant
+   in `GgufTensorType`. The plain k-quants (Q2_K / Q3_K / Q4_K / Q5_K /
+   Q6_K / Q8_K) all work; the IQ family is what bartowski / unsloth
+   use for sub-1.5-tok/s 2-bit / 3-bit exports.
+5. **Continuous batching** — the virtual-thread HTTP server accepts
+   concurrent requests, but each runs an independent prefill+decode
+   loop with no scheduler-driven grouping as in llama.cpp's
+   `llama-batch` + paged KV.
+6. **Other architectures** — Phi-3 / Gemma / Qwen2 / Command-R not
+   wired. `LlamaConfig.fromGguf(gguf.metadata())` parses
+   `general.architecture` but the key set is Llama-only; adding Phi-3
+   is a config + a forward-pass variant, no shared engine work.
+7. **FlashAttention-1/2** fused-attention kernels — not implemented.
+   Current SDPA is the per-head textbook `Q @ K^\u22a4 \u2192 softmax \u00d7 V`
+   over flat `KCache.row(head, pos..pos)` / `VCache.row(...)`, fine on
+   CPU at the \u2264 2 K-ctx bands our benchmarks cover.
+8. **RoPE scaling** beyond linear base-frequency is not implemented.
+   NTK-aware / dynamic NTK / YaRN / LongRoPE — all absent; `RopeCache`
+   reads `rope.freq_base` from GGUF metadata but ignores
+   `rope.scaling.type`.
+
+If you need any of the above for your use case, **llama.cpp** is the
+production reference (`brew install llama.cpp` on macOS, `apt install
+llama.cpp` on Ubuntu). AuraTensor is the no-JNI / zero-runtime-dep /
+Java 21+ SIMD alternative that benchmarks within \u22482\u00d7 of llama.cpp
+on a single darwin-arm64 NEON core \u2014 not a feature clone.
+
+---
+
 ## 🛠 Engineering Notes
 
 * **No JNI. No native code.** Every primitive is a Java method or an inner-loop call into `FloatVector`.
