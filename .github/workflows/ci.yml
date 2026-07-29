@@ -39,13 +39,13 @@ jobs:
       - name: Show JDK version
         run: java -version
 
-      # Override `maven.compiler.release` to match the matrix JDK. The pom.xml
-      # default is `<release>25</release>`; on JDK 21 javac rejects anything
-      # above 21, so we drop it per-matrix rather than changing the project's
-      # baseline (the README still advertises JDK 25 LTS as the production
-      # target). Maven property substitution overrides the `<release>` element
-      # inside the maven-compiler-plugin <configuration>, so the source still
-      # compiles cleanly on both JDKs.
+      # The pom.xml default <maven.compiler.release>25</maven.compiler.release>
+      # already matches the JDK 25 matrix; passing -Dmaven.compiler.release=25
+      # here is redundant but kept for future-flexibility if the matrix is
+      # ever extended (e.g. to add JDK 26 LTS). The JDK 21 matrix entry was
+      # dropped because the source uses the JDK 22+ finalized java.lang.foreign
+      # API shape (MemorySegment.get without ByteOrder parameter), which is
+      # illegal under JDK 21's Preview FFM API (JEP 442).
       - name: Build & test (release=${{ matrix.java }})
         run: |
           chmod +x ./mvnw
@@ -76,8 +76,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-m2-jdk${{ matrix.java }}-
 
-      # Same per-matrix release override as the test job so the fat jar is
-      # built against the same source/target level CI is testing.
+      # Same per-matrix release override as the test job.
       - name: Build fat jar (release=${{ matrix.java }})
         run: |
           chmod +x ./mvnw
