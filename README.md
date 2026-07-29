@@ -161,6 +161,44 @@ curl -N http://localhost:8080/v1/chat/completions \
 # Streamed Server-Sent Events, one data: line per token.
 ```
 
+### Run-log smoke test (real Llama-3.2-1B-Instruct-Q4_0, 30 seconds end-to-end)
+
+```bash
+$ java --enable-native-access=ALL-UNNAMED \
+      --add-modules jdk.incubator.vector \
+      -jar target/auratensor.jar \
+      --model ~/.auratensor/models/Llama-3.2-1B-Instruct-Q4_0.gguf \
+      --prompt "Q: 1+1? A:" \
+      --tokens 32
+WARNING: Using incubator modules: jdk.incubator.vector
+[AuraTensor] Java 25.0.2
+[AuraTensor] SIMD lane width: 128 bits
+[AuraTensor] GGUF v3  tensors=147  fileSize=773025920 bytes
+[AuraTensor] llama  ctx=131072  embed=2048  heads=32  layers=16  ffn=8192
+[AuraTensor] 24 tokens, 19.75s, 1.22 tok/s, prompt time=6.30s
+```
+
+Wall time: **~30 s** end-to-end (load → 10-token prefill → 24-token
+generate). The `1.22 tok/s` rate is in the same band as the
+`TokenThroughputBenchmark` real-model row at ctx=128 (2.35 tok/s mean
+on the same hardware) and not directly comparable: this CLI invocation
+is a **cold-JIT single run** (no warmup phase), whereas the bench
+averages over `3 × 2 s` warmup + `5 × 3 s` measurement and additionally
+pays per-token `System.out.print` + `flush` overhead the bench does
+not measure.
+
+**Caveats this smoke test surfaces:**
+
+* `--max-tokens` is **silently dropped** by `cli.Main`'s argument
+  parser — the actual flag accepted by the parser is `--tokens`
+  (see `printHelp()` below). Use `--tokens <n>` to cap generation.
+* Emitted characters above are non-printable / control bytes because
+  `cli.Main` ships a **placeholder tokenizer** (`char-mod-30000` mapping
+  per `Tokenizer.encode`/`decode` in the source). Real Llama-3 chat
+  prose requires `Llama3BpeTokenizer.fromGguf(gguf)` (the path used
+  by `TokenThroughputBenchmark`'s real-model setup) — wiring it into
+  `cli.Main` is a follow-up.
+
 ---
 
 ## 🧪 Tests & Benchmarks
