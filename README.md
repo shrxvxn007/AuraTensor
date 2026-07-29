@@ -1,5 +1,10 @@
 # AuraTensor
 
+[![CI status](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml/badge.svg)](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+![Java 25+](https://img.shields.io/badge/Java-25%2B-orange.svg)
+![Zero runtime deps](https://img.shields.io/badge/zero-runtime-deps-brightgreen.svg)
+
 **Zero-dependency, off-heap, SIMD-accelerated LLM inference engine in pure Java 21+.**
 Runs GGUF (Llama 3 / Mistral) models with throughput that competes with the C++ llama.cpp runtime — **no JNI, no third-party tensor libraries, no GPU required**.
 
@@ -18,6 +23,39 @@ AuraTensor is a from-scratch Java 21+ implementation of:
 7. **An OpenAI-compatible HTTP server** using the JDK `com.sun.net.httpserver.HttpServer` and Java 21 virtual threads, with Server-Sent Events streaming.
 
 The result: a single self-contained `auratensor.jar` that you can run on any Linux/x86_64, macOS/AArch64, or Windows/x86_64 host with JDK 25+.
+
+---
+
+## 📊 Status & Verifiability
+
+[![CI status](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml/badge.svg)](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml)
+The pipeline runs `./mvnw clean test` on every push (Ubuntu ×
+{Temurin JDK 21, Temurin JDK 25}) plus a programmatic JMH smoke
+iteration on the synthetic bench shape.
+
+**Headline real-model tokens/sec** — `TokenThroughputBenchmark`
+on darwin-arm64 NEON (Apple Silicon, Temurin JDK 25.0.2), real
+Llama-3.2-1B-Instruct-Q4_0 loaded via `GgufFile` + `Weights.load`:
+
+| ctx | ms/op | tokens/sec |
+|---|---|---|
+|  128 | 27 278.898 | **2.35** |
+|  512 | 28 195.458 | **2.27** |
+| 2048 | 29 372.911 | **2.18** |
+
+**Reproduce locally** on Linux / macOS / Windows × JDK 21+:
+
+```bash
+./mvnw clean test                                                              # 49 JUnit 5 tests, BUILD SUCCESS
+./mvnw -DskipTests clean package                                               # → target/auratensor.jar (Main-Class set)
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector \
+     -jar target/auratensor.jar --model ~/.auratensor/models/Llama-3.2-1B-Instruct-Q4_0.gguf \
+     --prompt "Q: 1+1? A:" --tokens 32                                          # 30 s end-to-end CLI smoke
+```
+
+Full bench table (scalar-vs-SIMD SGEMM GFLOPS, Q4_0/Q8_0 fusedDot
+GB/s, RMSNorm, sampler-perf) + JMH command lines live in
+[🧪 Tests & Benchmarks](#-tests--benchmarks) below.
 
 ---
 
