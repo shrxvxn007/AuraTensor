@@ -3,7 +3,7 @@
 [![CI status](https://github.com/shrxvxn007/AuraTensor/workflows/CI/badge.svg)](https://github.com/shrxvxn007/AuraTensor/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 ![Java 25+](https://img.shields.io/badge/Java-25%2B-orange.svg)
-![Zero runtime deps](https://img.shields.io/badge/zero-runtime-deps-brightgreen.svg)
+![Zero runtime deps](https://img.shields.io/badge/zero_runtime_deps-brightgreen.svg)
 
 **Zero-dependency, off-heap, SIMD-accelerated LLM inference engine in pure Java 21+.**
 Runs GGUF (Llama 3 / Mistral) models with throughput that competes with the C++ llama.cpp runtime — **no JNI, no third-party tensor libraries, no GPU required**.
